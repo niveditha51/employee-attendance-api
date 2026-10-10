@@ -1,7 +1,7 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# DECISIONS.md
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** Unique `employees.emp_code` and unique `attendance_logs(emp_code, date)` give the one-record-per-day guarantee. `attendance_logs(emp_code, punch_in)` finds the open record for punch-out. `attendance_logs(date, emp_code)` serves the list sort and the leaderboard's month range. `employees(department, emp_code)` and `employees(joined_on)` serve the employee list and the summary. I rejected an index on `status`: it has only five values, so it is not selective.
+2. **Punch-in race.** Both requests build the same document and call `insert_one`. The unique index lets exactly one succeed. The other raises `DuplicateKeyError`, which I return as 409, so there is no gap between a check and the insert.
+3. **Ties.** I use `$rank` and then keep `rank <= limit`, so everyone tied at the cutoff is returned and the list can be longer than `limit`. Cutting a tie arbitrarily would be unfair.
+4. **Headcount.** The summary starts from `employees` and uses `$lookup`, so an employee with no logs still gets an empty array and is counted once in the `$group`.
+5. **At 100x data.** The trend endpoint loads all department employees into Python and sends their codes in `$in`. I would store a department on each log, or run the lookup inside MongoDB.
