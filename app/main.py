@@ -12,7 +12,7 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
  
 load_dotenv()
@@ -30,6 +30,7 @@ async def lifespan(app):
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
     yield
  
  
@@ -156,6 +157,11 @@ class PunchInIn(BaseModel):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
  
  
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[StrictInt] = Field(default=None, ge=100_000_000_000, le=4_102_444_800_000)
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
@@ -257,9 +263,50 @@ def list_attendance(
     return {"items": [attendance_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
  
  
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    if body.punched_at is not None:
+        ts = datetime.fromtimestamp(body.punched_at // 1000, tz=timezone.utc)
+    else:
+        ts = datetime.now(timezone.utc).replace(microsecond=0)
+ 
+    # Most recent record whose punch_in is at or before ts (works across midnight).
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", -1)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+ 
+    punch_in = _aware(rec["punch_in"])
+    if ts <= punch_in or ts - punch_in > timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours of it")
+ 
+    work_hours = compute_work_hours(punch_in, ts)
+    update = {
+        "punch_out": ts,
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime(ts, emp["shift_start"], emp["shift_end"], rec["date"]),
+        "half_day": work_hours < 4.5,
+    }
+    # The filter carries the condition, so only one of two simultaneous requests can match.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": update},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return attendance_out(updated)
+ 
+ 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
@@ -267,3 +314,4 @@ def list_attendance(
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+ 
