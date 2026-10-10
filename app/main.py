@@ -30,11 +30,16 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+GRACE_MINUTES = 10  # confirm against R2
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+    if punch_in.tzinfo is None:                      # PyMongo returns naive UTC
+        punch_in = punch_in.replace(tzinfo=timezone.utc)
+    local = punch_in.astimezone(IST)                 # compare in IST
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    start = local.replace(hour=h, minute=m, second=0, microsecond=0)
+    minutes = int((local - start).total_seconds() // 60)
+    return minutes if minutes > GRACE_MINUTES else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
