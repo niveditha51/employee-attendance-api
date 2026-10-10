@@ -5,12 +5,14 @@ Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
 import bisect
 import calendar
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date as Date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
  
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
@@ -425,15 +427,7 @@ def punch_in(body: PunchInIn):
     return attendance_out(doc)
  
  
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-):
+def attendance_query(emp_code, date_from, date_to, status) -> dict:
     if date_from:
         parse_date_or_422(date_from, "date_from")
     if date_to:
@@ -451,6 +445,19 @@ def list_attendance(
             q["date"]["$lte"] = date_to
     if status:
         q["status"] = status
+    return q
+ 
+ 
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = attendance_query(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q)
     cursor = (
         db.attendance_logs.find(q)
@@ -588,6 +595,25 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
     return attendance_out(updated)
  
  
+def trend_inputs(department: str, from_: str, to: str):
+    parse_date_or_422(from_, "from")
+    parse_date_or_422(to, "to")
+    d_from, d_to = Date.fromisoformat(from_), Date.fromisoformat(to)
+    if d_to < d_from:
+        raise HTTPException(422, "to must not be before from")
+    if (d_to - d_from).days + 1 > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "unknown department")
+    return emps, d_from, d_to
+ 
+ 
+def summary_hint(department: Optional[str]) -> dict:
+    # Pin the employees index so the plan is an IXSCAN even when most employees match the range.
+    return {"department": 1, "emp_code": 1} if department else {"joined_on": 1}
+ 
+ 
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_RE)):
     emp = db.employees.find_one({"emp_code": emp_code})
@@ -617,7 +643,7 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_RE)):
 def department_summary(month: str = Query(..., pattern=MONTH_RE), department: Optional[str] = None):
     first, last = month_bounds(month)
     items = []
-    for g in db.employees.aggregate(summary_pipeline(first, last, department)):
+    for g in db.employees.aggregate(summary_pipeline(first, last, department), hint=summary_hint(department)):
         n = int(g["wh_n"])
         avg = None
         if n:
@@ -650,16 +676,7 @@ def late_leaderboard(
  
 @app.get("/analytics/departments/{department}/trend")
 def department_trend(department: str, from_: str = Query(..., alias="from"), to: str = Query(...)):
-    parse_date_or_422(from_, "from")
-    parse_date_or_422(to, "to")
-    d_from, d_to = Date.fromisoformat(from_), Date.fromisoformat(to)
-    if d_to < d_from:
-        raise HTTPException(422, "to must not be before from")
-    if (d_to - d_from).days + 1 > 92:
-        raise HTTPException(422, "range must not exceed 92 days")
-    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
-    if not emps:
-        raise HTTPException(404, "unknown department")
+    emps, d_from, d_to = trend_inputs(department, from_, to)
     joined = sorted(e["joined_on"] for e in emps)
     rows = list(db.attendance_logs.aggregate(trend_pipeline([e["emp_code"] for e in emps], d_from, d_to)))
  
@@ -688,8 +705,63 @@ def department_trend(department: str, from_: str = Query(..., alias="from"), to:
     return {"department": department, "items": items}
  
  
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}")
+def admin_explain(
+    endpoint: Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_RE),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    def need(**params):
+        missing = [k for k, v in params.items() if v is None]
+        if missing:
+            raise HTTPException(422, f"missing required parameter(s): {', '.join(missing)}")
+ 
+    if endpoint == "attendance_list":
+        q = attendance_query(emp_code, date_from, date_to, status)
+        collection = "attendance_logs"
+        cmd = {
+            "find": collection,
+            "filter": q,
+            "sort": {"date": -1, "emp_code": 1},
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            need(emp_code=emp_code, month=month)
+            first, last = month_bounds(month)
+            collection, pipeline, hint = "attendance_logs", monthly_pipeline(emp_code, first, last), None
+        elif endpoint == "department_summary":
+            need(month=month)
+            first, last = month_bounds(month)
+            collection = "employees"
+            pipeline, hint = summary_pipeline(first, last, department), summary_hint(department)
+        elif endpoint == "late_leaderboard":
+            need(month=month)
+            first, last = month_bounds(month)
+            collection, pipeline, hint = "attendance_logs", leaderboard_pipeline(first, last, limit, department), None
+        else:  # department_trend
+            need(department=department, **{"from": from_, "to": to})
+            emps, d_from, d_to = trend_inputs(department, from_, to)
+            collection, hint = "attendance_logs", None
+            pipeline = trend_pipeline([e["emp_code"] for e in emps], d_from, d_to)
+        cmd = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+        if hint:
+            cmd["hint"] = hint
+ 
+    result = db.command({"explain": cmd, "verbosity": "executionStats"})
+    return {
+        "endpoint": endpoint,
+        "collection": collection,
+        "explain": json.loads(json_util.dumps(result, json_options=json_util.RELAXED_JSON_OPTIONS)),
+    }
  
