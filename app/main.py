@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -30,26 +31,37 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-GRACE_MINUTES = 10  # confirm against R2
+def _aware(dt: datetime) -> datetime:
+    # PyMongo gives naive datetimes (they are UTC). Make them timezone-aware.
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    if punch_in.tzinfo is None:                      # PyMongo returns naive UTC
-        punch_in = punch_in.replace(tzinfo=timezone.utc)
-    local = punch_in.astimezone(IST)                 # compare in IST
+
+def compute_late_minutes(punch_in: datetime, shift_start: str, shift_end: str) -> int:
+    local = _aware(punch_in).astimezone(IST).replace(microsecond=0)
     h, m = map(int, shift_start.split(":"))
-    start = local.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((local - start).total_seconds() // 60)
-    return minutes if minutes > GRACE_MINUTES else 0
+    start = local.replace(hour=h, minute=m, second=0)
+    if shift_end <= shift_start and local.strftime("%H:%M") < shift_end:
+        start -= timedelta(days=1)  # overnight shift that started yesterday
+    seconds = (local - start).total_seconds()
+    return int(seconds // 60) if seconds > 600 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    punch_in = _aware(punch_in).replace(microsecond=0)
+    punch_out = _aware(punch_out).replace(microsecond=0)
+    seconds = int((punch_out - punch_in).total_seconds())
+    hours = (Decimal(seconds) / Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(hours)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
+def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date_str: str) -> int:
+    punch_out = _aware(punch_out).replace(microsecond=0)
     h, m = map(int, shift_end.split(":"))
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    if shift_end <= shift_start:  # overnight shift ends the next day
+        end += timedelta(days=1)
+    minutes = int((punch_out - end).total_seconds() // 60)
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
